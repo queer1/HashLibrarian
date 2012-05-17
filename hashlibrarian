@@ -1,0 +1,963 @@
+#!/usr/bin/perl
+
+#HashLibrarian
+#Written by Michael Sweeney, msweeney098@gmail.com
+#Student at the Rochester Institute of Technology
+#
+#Written for Computer System Forensics (4050 581)
+
+#The purpose of this program is to allow for quick and easy hashing of a single file, or an entire disk.
+#There are some features added for forensic benefit, such as saving these hashes to a database, and encrypting said database.
+#This database can then be re-loaded and compared against a new directory to find specific files
+
+use strict;
+use warnings;
+use File::Find;
+use Cwd;
+
+#A database of hashes to load and compare
+#make an array of hashes, so the user can load as many as they want
+#http://docstore.mik.ua/orelly/perl/prog3/ch09_03.htm
+
+my @ComparisonDatabasePaths;
+my @ComparisonDatabaseHashFirst;
+my @ComparisonDatabaseFilenameFirst;
+my $totalDatabasesLoaded = 0;
+
+#when a match is found, a 1 is placed into matchflags, and the database name is added to matchDatabases with a key of the filename
+my @matchFlags;#array of flags
+my %matchDatabases;
+
+#The absolute filenames are the keys
+my %SHA1Sums;
+my %SHA256Sums;
+my %MD5Sums;
+
+#paths
+my $currentDirectory;
+my $startDirectory = "/";
+my $filePath;
+my $databasePath=0;#Where we're saving the database to
+my $reportPath; #Where we're saving the HTML report to
+my $comparisonDBPath;
+
+#Flags used for operation
+my $doVerbose = 0; #flag. do we want more output?
+my $doReport=0;#Flag. Do we want to generate an HTML report?
+my $doDatabase=0;#flag
+my $doComparison=0;
+my $hashingDirectory=0;#flag.
+my $hashingFile=0;#flag.
+my $doTerminal=0;
+my $noChattr=0;
+my $doKeyHound=0;
+my $doProtect=0;
+my $gatheringArguments=1; #this keeps us inside the loop, reading in args
+
+#date information
+my $startDate = `date`;
+my $endDate;
+
+#counters
+my $filesHashed = 0;
+my $totalMatches=0;
+my $numArgs=0;
+
+#other data
+my $filesInDirectory;
+my $tempPath = "";
+
+
+sub HashLibrarian
+{
+	#Hashlibrarian is a forensically sound perl script that is meant to run on
+	#a machine that has PERL, GPG, and OpenSSL installed. It should be run
+	#on a disk image that is mounted on a system as read-only.
+
+	#There are many ways to run hashlibrarian. There's a list of arguments a few lines down.
+
+
+	#First, tell the user the time of day, what is running, and possibly kill the program if
+	#we aren't being run correctly.
+	print "HashLibrarian - Written by MSweeney\n";	
+	if(@ARGV == 0)
+	{
+		showUsageAndDie();
+	}	
+
+	print "The current date: ";
+	printDate();
+	print "\n";
+
+	my $iteration = 0;#this variable keeps track of what current argument we're looking at within the string of args being passed
+
+	foreach my $arg (@ARGV) #run through the arguments
+	{
+		
+		#This is a flag-setting area.
+		#We scan through the arguments, spit out extra output if we're running as verbose
+		#When we run into a valid switch, we set the appropriate flags so HashLibrarian knows how to operate
+		#These swiches can be in any order
+
+		if($arg eq "-v") 	{ $doVerbose=1; print "Analyzing options:\n"; print "Verbose On\n"; }
+		if($arg eq "-nochattr") { $noChattr=1; if($doVerbose==1) { print "Chattr +i disabled\n"; } }
+		if($arg eq "-d")
+		{
+			$hashingDirectory=1;
+			$startDirectory=$ARGV[$iteration+1];
+			if(defined($startDirectory))
+			{
+				if(isDirectory($startDirectory)==0) { die "Invalid directory -d $startDirectory\n"; }			
+			}
+			else
+			{
+				die "Please specify a directory to hash.\n";
+			}			
+			if($doVerbose==1) { print "Hashing Directory $startDirectory\n"; }
+		}
+		if($arg eq "-f") 	#hash a file
+		{
+			$hashingFile=1; 
+			$doTerminal=1;
+			$filePath = $ARGV[$iteration+1];
+			if(defined($filePath))
+			{
+				if($doVerbose==1)
+				{
+					print "Hashing File $filePath\n";
+				}
+			}
+			else
+			{
+				die "Please specify a file to hash.\n";
+			}
+		}			
+		if($arg eq "-db")	#generate a database of the current results
+		{
+			$doDatabase=1;
+			$databasePath = $ARGV[$iteration+1];
+			if(defined($databasePath))
+			{
+				if(isDirectory($databasePath)==0) { die "Invalid directory -db $databasePath\n"; }			
+			}
+			else
+			{
+				die "Please specify a database path.\n";	
+			}			
+			if($doVerbose==1) { print "Creating Database at $databasePath\n"; }
+		}
+		if($arg eq "-rp")	#Generate an HTML report
+		{
+			$doReport=1;
+			$reportPath = $ARGV[$iteration+1];
+			if(defined($reportPath))
+			{
+				if(isDirectory($reportPath)==0) { die "Invalid Directory -rp $reportPath\n"; }
+			}
+			else
+			{
+				die "Please specify a report path.\n";
+			}			
+			if($doVerbose==1) { print "Creating HTML Report at $reportPath\n"; }
+		}
+		if($arg eq "-compare")	#compare to another database
+		{
+			$doComparison=1;
+			$comparisonDBPath=$ARGV[$iteration+1];
+			if(defined($comparisonDBPath)) { }
+			else
+			{
+				die "Please specify a comparison database.\n";
+			}
+							
+			if($doVerbose==1) { print "Comparing Results with other databases.\n"; }
+		}
+		if($arg eq "-term")	{ $doTerminal=1; if($doVerbose==1) { print "Outputting hashes to terminal\n"; } }	
+		if($arg eq "-protect") { $doProtect=1; if($doVerbose==1) { print "Protecting the database with GPG and chattr +i\n"; } }	
+		if($arg eq "-compare") 
+		{ 
+			$doComparison=1; 
+			while($gatheringArguments!=0)
+			{
+					#As of right now, $ARGV[$iteration] equals -compare, which made us go down this path.
+					#We don't know how many arguments are to follow, since we allow as many databases as the user wants.
+					#Paths don't begin with dash, but arguments do, so we can start with that rule
+					#to help us figure out where to stop.
+					
+					#We're going to start with the current $iteration value, and increment all the way				
+					#up to the next switch.
+					my $start = $iteration+1;	#+1 because our current place in $ARGV begins with dash (see inside the while statement)
+					my $break = 0;	#when to exit the loop
+					my $argvSize = scalar @ARGV;
+					while()#last is equal to break
+					{						
+											
+						chomp($ARGV[$start]);#pull off the \n				
+												
+						if($ARGV[$start] =~ m/^-/ )		#if we have encountered another argument or the end of the array
+						{ 
+							#$break=1;
+							last;
+						}
+						else #if we've just read in a path
+						{
+							$tempPath = $ARGV[$start]; 	#add the path to a temporary variable	
+							
+							if(isDirectory($tempPath)==0) { die "Invalid Directory -compare $tempPath\n"; }
+							if($doVerbose==1) { print "Added $tempPath to the comparison database.\n"; }
+							push(@ComparisonDatabasePaths, $tempPath);		#add the database to the list
+							$totalDatabasesLoaded++;
+						}
+						if(($start+1) == $argvSize) { last; }	#If we're about to read an index that doesn't exist in the list given to us, exit the loop
+						#print "\n\n$start (s), @ARGV (a)\n"; 						
+						$start++; #Move ahead in our string of arguments
+						
+					}
+					$gatheringArguments=0;
+			
+			}
+			populateComparisonHashes();	#Parse through all of the databases given, and populate the @ComparisonDatabase variable
+			#After we have populated the hashes with the appropriate data, we can move on with program execution
+		}
+		$iteration++;	#Move along to the next item in the list of arguments
+		$numArgs++;
+	}
+	checkConfiguration();
+	
+	#Let the verbose users know what's going on with our databases
+	if($doVerbose==1 and $doComparison==1)
+	{
+		print "The following databases have been loaded for comparisons:\n";
+		foreach my $line (@ComparisonDatabasePaths)
+		{
+			print $line . "\n";
+		}
+	}
+
+	#Now that we've got all of our arguments collected, we need to analyze them and take the appropriate action
+	#The following is a list of "Is this flag set? If so, do this."
+
+	if($hashingDirectory==0 and $hashingFile==0)	#If no file or directory is specified
+	{
+		print "Error - A file or directory must be specified\n";
+		showUsageAndDie();#exit
+	}
+	if($hashingDirectory==1)	#If a directory was specified
+	{
+		if($startDirectory =~ m/^-/)		#Make sure that the next item in line is a directory, not a switch (which begins with a -)
+		{
+			die "Error - $startDirectory is not a valid directory\n";
+		}
+		else
+		{
+			hashDirectory();
+		}
+	}
+		
+
+	print "\n";
+	#If we're only asking to hash a single file, just do that
+	if($hashingFile == 1) { hashFile($filePath); }
+	#If we're going to export a database of all of the files and their hashes (MD5 and SHA1), do this here
+	if($doDatabase==1) { exportDatabase(); }
+	#If we're going to export an HTML report of our results, do this here also
+	if($doReport==1) { exportReport(); }
+
+	#Once completed, let the user know that we're finished and output the time
+	$endDate = `date`;
+	print "HashLibrarian operations finished @ $endDate\n";
+	#If we're doing a comparison of databases, let the user know how many matches came up
+	if($doComparison==1) { print "In total, $totalMatches hash matches were found(".($totalMatches/3)." files), based on the databases loaded for comparison.\n"; }
+	print "\n";
+}
+
+sub populateComparisonHashes()
+{
+	#This function creates an array of hashes.
+	#An array of hashes lets us increment through them.
+	#Incrementing through an array of hashes is far simpler than having a hash of hashes.
+
+	#Ultimately, there are about two ways that a hash comparison can be useful
+	#	-A hash-to-hash comparison to see if a hash exists on a system
+	#	-A filename based hash comparison (like having a backup database to see if a file changed)
+
+	#This function also decrypts and verifies existing databases to ensure that they're valid for use.
+	#This functionality is provided by GPG
+
+	$totalDatabasesLoaded=0;
+	my @ProtectHashes;#Our protection hashes will be stored here
+	#A protection hash is simply a hash of either the unencrypted database file, or the encrypted one.
+	#These are stored in the database.db.protect.gpg file.
+
+	#Populate a perl hash in the array with each database's data set (filename"hash)
+	foreach my $database (@ComparisonDatabasePaths)
+	{
+		#let's check and see if the database that the user has chosen is protected
+		if(-f "$database.protect.gpg")#Does the database file exist? If yes...
+		{
+			#Let the user know.
+			#This part is not set under a "verbose-only" conditional because want to always
+			#inform the user what we're doing with their cryptography passwords.
+			#We don't even see the passwords, they're sent directly to GPG (or sudo)			
+			print "Encrypted protection file found for $database.\n";
+			print "Before hashlibrarian can use this database, it needs to be decrypted.\n";
+			print "GPG says...\n";
+			system ("gpg -d $database.protect.gpg > $database.protect.ungpg");#Decrypt our protection file (which contains the hashes of the databases)
+			open(PROT, "$database.protect.ungpg");#Open it
+			my @data = <PROT>;#And grab the data
+			close(PROT);
+			#system("rm $database.protect.ungpg");#Remove the decrypted file for cleanliness
+			foreach my $line (@data)#For each line in the decrypted protection file...
+			{
+				 my @d=split(/\"/, $line);
+				 chomp($d[1]);
+				 push(@ProtectHashes, $d[1]);#Add the hash to the @ProtectHashes array
+			}
+			#If the user wants to see them, show them the hashes of each file. This is important for independent verification			
+			if($doVerbose==1)
+			{
+				print "Protection hashes\n";
+				foreach my $hash (@ProtectHashes)
+				{
+					print "$hash\n";
+				}
+			}
+			#now let's verify the databases before we use them
+			my $currentDBMD5 = `md5sum $database.gpg`; #Create a new hash of the encrypted database file
+			my $ValidDB = 0;
+			$currentDBMD5 = stripAndReturn($currentDBMD5);#Pull out the clean hash
+			chomp($currentDBMD5);#Remove the endline
+			if($doVerbose==1) { print "Current MD5 is $currentDBMD5\n"; }
+			
+			#before we do anything else, make sure that the files we're about to write to are writable
+			if( -w "$database" and -w "$database.db.protect.gpg")
+			{
+			
+				#Compare our newly generated hash against the one loaded from the protection file
+				foreach my $phash (@ProtectHashes)
+				{
+					if(compareHashes($phash,$currentDBMD5)==1)#If we have a hash, make a note that we're working with a valid database
+					{
+						$ValidDB=1;
+						print "$database has succeeded all verification checks.\n";
+					}
+				}
+				if($ValidDB==0)#if verification failed, quit
+				{
+					die "The database $database is corrupt, and is therefore unreliable. Exiting.\n";
+				}		
+			}
+			else
+			{
+				#die "Either $database or $database.protect.gpg are not writable. Please ensure these files are writable.\n";
+			}		
+		}
+		else	#We don't *require* an encrypted protection file to use a database with HashLibrarian... But it helps.
+		{
+			if( -e $database) {  }
+			else
+			{
+				die "Database $database not found for comparison.\n";
+			}
+			print "*NOTE: $database does not have a .protect.gpg file associated with it\n";
+			print "*This isn't exactly a problem, provided that this file has been kept safe through other means of encryption.\n";
+			print "*If it has not been, or if you doubt it's integrity, re-creating the database with the -protect switch added is the best option.\n";
+		}
+		#Now that our database is cryptographically verified to be secure (and has been decrypted), let's open it and work with it.
+		open(DB, $database);
+		if($doVerbose==1) { print "Attemping to open $database\n"; }
+		my @content = <DB>;
+		
+		#now that we have our database file opened and read into @content,
+		#we need to add all of the contents into @ComparisonDatabase
+		#in it's own array
+		foreach my $record (@content)
+		{
+			chomp($record);#take off the newline character at the end of the line			
+			my @data = split(/\"/, $record);#split the parts along the whitespace
+			my $filename = $data[0];
+			my $hash = $data[1];
+			
+			#This line moves to the @ComparisonDatabase->Entry 0, which contains a hash.
+			#This hash has an entry with $filename as a key, which has the contents of
+			#that file's hash.
+			$ComparisonDatabaseFilenameFirst[$totalDatabasesLoaded]{$filename} = $hash;
+		
+			#As wasteful as it seems, we need to generate two different hashes.
+			#The first hash has the filename as the key, which returns the hash of that file. This type of hash
+			#is useful for finding out what the loaded databases have on record for a specific file.
+			
+			#The second has the hash as the key, which returns the filename. This is useful for when
+			#we want to scan a database for a specific hash, like if the user provides a
+			#database of hashes they want to check for. We can use the hash value to return the file
+			#it was found on to present to the user.
+
+			$ComparisonDatabaseHashFirst[$totalDatabasesLoaded]{$hash} = $filename;
+		}
+		$totalDatabasesLoaded++;
+		#move on to the next database		
+	}
+	#Once we've reached this point, all of our databases have been loaded into the comparison database
+	#and have been cryptographically verified for accuracy.
+
+}
+
+
+sub printDate()
+{
+	print `date`;	#Simply output the current system time
+}
+
+sub fileFound()
+{
+	#Function: fileFound()
+	#Input: Absolute File path
+	#Output: Provides file-detection message (verbose only)
+	#Summary: Resets the console cursor's position for writing to the same line,
+	#	  and puts the passed file through hashFile().
+	
+	if($doVerbose==1) { print "Found File: $_\n"; }
+	
+	hashFile("$_");
+	my $currentPercent = (($filesHashed)/$filesInDirectory)*100;
+	$currentPercent = sprintf("%.1f", $currentPercent);
+	print "($filesHashed files hashed, $currentPercent%)";
+	moveToTerminalLeft();
+}
+
+sub hashFile()
+{		
+	#Function: hashFile()
+	#Input: Absolute File Path
+	#Output: Verbose hashing-related messages
+	#Summary: Hashes a file and adds the result to a PERL hash.
+	#	  Uses MD5 and SHA1. Tests file to see if it is writable
+	#	  or a directory first.
+
+	my $file = shift();
+	resolveFullPath($file);
+	if($doVerbose==1)
+	{
+		print "Hashing file $file\n";
+		printDate();
+	}
+
+	#here, we do some quick file tests to see if we should attempt to hash a file
+	if(-d $file)#If this is a directory, don't hash it
+	{
+		if($doVerbose==1) {
+			print "$file is a directory\n";
+		}
+	}
+	
+	else
+	{
+		if(-r $file)#Check if the file is readable
+		{
+			#if readable, let's hash the file
+			my $sha1 = `sha1sum "$file"`;
+			my $md5 = `md5sum "$file"`;			
+			my $sha256 = `sha256sum "$file"`;			
+
+			$filesHashed++;
+	
+			if($doTerminal==1)#if the user wants the output in the terminal
+			{	
+				print "(SHA1)";
+				stripAndPrint($sha1, "SHA1");
+				print "(MD5)";
+				stripAndPrint($md5, "MD5");
+				print "(SHA256)";
+				stripAndPrint($sha256, "SHA256");
+			}
+			#add this information to the database
+			$sha1=stripAndStoreSHA1($sha1);
+			$md5=stripAndStoreMD5($md5);
+			$sha256 = stripAndStoreSHA256($sha256);
+			#now sha1 and md5 both contain the hashes of each file. We can now scan for matches.
+			checkForMatches($sha1, $file, $filesHashed);
+			checkForMatches($md5, $file, $filesHashed);
+			checkForMatches($sha256, $file, $filesHashed);
+	
+		}
+		else
+		{
+			print "Insufficient permissions to read: $file\n";
+		}		
+		
+	}
+	$endDate = `date`;
+
+
+}
+
+sub checkForMatches()
+{
+	my $hashToTest = $_[0];
+	my $sourceFilename = $_[1];
+	my $id = $_[2];
+	my $match = 0; #flag. set to 1 if match is found
+	my $matchFilename;
+	my $db = 0;
+	#now, we need to scan against every hash in the databases
+	#this requires incrementing through each database
+
+	chomp($hashToTest);
+	foreach (@ComparisonDatabaseHashFirst)
+	{
+		if( exists $ComparisonDatabaseHashFirst[$db]{$hashToTest})
+		{
+			#now that we have found a match, let's present that to the user	
+			$matchFilename = $ComparisonDatabaseHashFirst[$db]{$hashToTest};			
+			print ">Match found from database $ComparisonDatabasePaths[$db], in file $matchFilename\n";
+			print ">This file matches with $sourceFilename that was just scanned ";
+
+			#Now
+			if($doReport==1)
+			{
+				#we need to somehow add all of the matches to the report
+				#this is best done live, as we find them
+				#When a match is found, note that we found it, and add the database
+				#that the match came from to another database
+				$matchFlags[$id]=1;
+				$matchDatabases{$sourceFilename}=$ComparisonDatabasePaths[$db];
+				
+			}
+
+			if(length($hashToTest)==40) { print "(MD5 Match)"; $match=1; }
+			if(length($hashToTest)==32) { print "(SHA1 Match)"; $match=1; }
+			if(length($hashToTest)==64) { print "(SHA256 Match)"; $match=1; }			
+
+			#else { print "(SHA1 Match) (".length($hashToTest).")\n"; }
+			print " @ ";
+			printDate();
+			print "\n\n";
+			$totalMatches++;
+		}
+		$db++;
+	}
+	return $match;
+}
+sub hashDirectory()
+{
+	#Function: hashDirectory()
+	#Input: None (Uses $startDirectory global variable, populated by the original args passed)
+	#Output: The date of completion, plus debug messages
+	#Summary: Walks the directory structure, and when a file is found, the function fileFound is
+	#	  called so the file can be marked as 'found' and hashed.
+	print "\n\tCalculating size of directory.";
+	$filesInDirectory = `find $startDirectory -type f | wc -l`;	#Figure out how many files exist in the directory (including hidden files)
+	chomp($filesInDirectory);	
+	print "... $filesInDirectory files found.\n\n";
+	if($doVerbose==1) { print "Starting to hash $startDirectory\n"; }	
+	find(\&fileFound, $startDirectory);
+	if($doVerbose==1) { print "Hashing of $startDirectory complete!\n"; }
+	$endDate = `date`;
+}
+
+
+
+sub stripAndPrint()
+{
+	#this function splits the output of the "openssl [hashalg]" command
+	#and outputs it to the screen for the user to view
+	my @args = shift();#grab the arguments
+
+	my @parts = split(/\s+/, $args[0]);#split along the whitespace
+	my $cd = cwd();
+	print " $parts[1] - $parts[0]\n";#print the reformatted output
+}
+
+sub resolveFullPath()
+{
+	my $partial = shift();
+	my $path = cwd();
+	
+
+	#we need to identify what kind of path this is
+	#if it begins with a /, we're looking at an absolute path
+	#if not, it's relative
+	if($partial =~ m/^\//) #an absolute path
+	{
+		#do nothing, this is an absolute path
+		#print $partial . "\n";
+		$filePath = $partial;
+	}
+	else
+	{
+		#print $path . "/" . $partial  . "\n";
+		$filePath = $path . "/" . $partial;
+	}
+	
+}
+
+sub isDirectory()#Check and see if we're looking at a valid directory
+{
+	my $arg = shift();
+	my $dirStart = 0;	
+	my $isValid = 0;
+
+	if(defined($arg))
+	{
+		my @pathSplit = split('',$arg);#split up into pieces so we can analyze each part
+	
+		if($pathSplit[$dirStart] eq '/')
+		{
+			$isValid = 1;	
+		}
+		elsif($pathSplit[$dirStart] eq '~')
+		{
+			$isValid = 1;
+		}
+		else
+		{
+			$isValid = 0;
+		}
+		return $isValid;
+	}
+}
+
+sub exportDatabase()
+{
+	my $key;
+	my $value;
+	my $f = shift();
+
+	#output hashes to file
+	open(DB, ">", $databasePath);
+	#print DB "Started: $startDate\n\n";
+	#print DB "SHA1\n\n";
+	while (($key, $value) = each(%SHA1Sums)){
+		     print DB $key."\"".$value."\n";
+	}
+	#print DB "\n\nMD5\n\n";
+	while (($key, $value) = each(%MD5Sums)){
+		     print DB $key."\"".$value."\n";
+	}
+	#SHA256
+	while (($key, $value) = each(%SHA256Sums)){
+		     print DB $key."\"".$value."\n";
+	}
+	#print DB "Ended:" . `date`;
+	close(DB);
+	#encrypt database
+	#system("gpg -e $f");
+
+	if($doVerbose==1) 
+	{
+		print "Database exported to $databasePath\n";
+	}
+	if($doProtect==1)
+	{
+		#Here's where we create our protected databases.
+
+		#We start by letting the user know what's going on, regardless of $doVerbose.
+		#Next, we are at Step (1), where we encrypt the database file, and then write protect it with chattr +i 
+		#After that's completed, we move to step (2), which involves creating our protection file.
+		#This is simply a file that contains four hashes. The SHA1 and MD5 sums for both our unencrypted
+		#database and our encrypted database files.
+		#At step (3), we create the protection file and add the checksums for the unencrypted database to it
+		#At Step (4), we hash the encrypted database and strip the output.
+		#Step (5), we print this information into the protection file, and then encrypt and chattr +i it.
+		
+		print "$databasePath (database) has been chosen to be protected.\n";
+		print "This involves GPG encryption of the database file, and hashing the unencrypted and encrypted database files.\n";
+		print "These hashes are added to a .protect file, which is also encrypted.\n";
+		if($noChattr==0) { print "All files have chattr +i applied.\n"; }
+		print "\nEncrypting the database file... GPG Says:\n";
+		
+		#Step (1)		
+		system ("sudo gpg -e $databasePath");		#have the user encrypt the file
+		if($noChattr==0) {
+			print "\n\nChattr +i on $databasePath and $databasePath.gpg.\n";
+			system ("sudo chattr +i $databasePath");#write protect the file
+			system ("sudo chattr +i $databasePath.gpg");#write protect the encrypted database
+		}
+
+		#Step (2)
+		print "These files will now be hashed, and the resulting hashfile will be encrypted.\n";
+		my $sha1 = `sha1sum $databasePath`;
+		my $md5 = `md5sum $databasePath`;
+		my $sha256 = `sha256sum $databasePath`;
+		$sha1=stripAndStoreSHA1($sha1);
+		$md5=stripAndStoreMD5($md5);
+		$sha256=stripAndStoreSHA256($sha256);
+	
+		#Step (3)
+		open(PROT, ">", "$databasePath.protect");
+		print PROT "$databasePath\"$sha1\n";
+		print PROT "$databasePath\"$md5\n";
+		print PROT "$databasePath\"$sha256\n";
+
+		#Step (4)
+		$sha1 = `sha1sum $databasePath.gpg`;
+		$md5 = `md5sum $databasePath.gpg`;
+		$sha256 = `sha256sum $databasePath.gpg`;
+		$sha1=stripAndReturn($sha1);
+		$md5=stripAndReturn($md5);
+		$sha256=stripAndReturn($sha256);
+		
+		#Step (5)
+		print PROT "$databasePath.gpg\"$sha1\n";
+		print PROT "$databasePath.gpg\"$md5\n";
+		print PROT "$databasePath.gpg\"$sha256\n";
+		close(PROT);
+		print "Encrypting $databasePath.protect... GPG says:\n";
+		system("sudo gpg -e $databasePath.protect");
+		if($noChattr==0) {
+			print "\nChattr +i on $databasePath.protect.gpg\n";
+			system("sudo chattr +i $databasePath.protect.gpg");
+		}
+
+		#Let the user know how the operation went
+		if( -e "$databasePath.protect.gpg") { print "Protection complete!\n"; }
+		else
+		{
+			print "Protection failed. Please double-check GPG's configuration and try to re-protect the database.\n";
+		}	
+	}
+		
+}
+
+sub stripAndStoreSHA1()
+{
+	#Function: stripAndStoreSHA1()
+	#Input: A sha1 checksum
+	#Output: The hash, cleaned of any GPG output
+	#Summary: This function splits the output of the "openssl [hashalg]" command
+	#		and adds it to a perl hash for database output later
+
+	my @args = shift();#grab the arguments
+	my @parts = split(/\s+/, $args[0]);#split along the whitespace
+	#the hash uses the filename as the key, and the hash as the value
+	$SHA1Sums{"$parts[1]"} = $parts[0];
+	return $parts[0];#our hash
+}
+sub stripAndStoreMD5()
+{
+	#this function splits the output of the "openssl [hashalg]" command
+	#and adds it to a perl hash for database output later
+
+	my @args = shift();#grab the arguments
+	my @parts = split(/\s+/, $args[0]);#split along the whitespace
+	#the hash uses the filename as the key, and the hash as the value
+	$MD5Sums{$parts[1]} = $parts[0];
+	return $parts[0];#our hash
+}
+
+sub stripAndStoreSHA256()
+{
+	#this function splits the output of the "openssl [hashalg]" command
+	#and adds it to a perl hash for database output later
+
+	my @args = shift();#grab the arguments
+	my @parts = split(/\s+/, $args[0]);#split along the whitespace
+	#the hash uses the filename as the key, and the hash as the value
+	$SHA256Sums{$parts[1]} = $parts[0];
+	return $parts[0];#our hash
+}
+
+
+sub stripAndReturn()
+{
+	my @args = shift();
+	my @parts = split(/\s+/, $args[0]);#split along the whitespace
+	return $parts[0];#return the hash
+}
+
+sub exportReport()
+{
+	#here, we want to export everything to an HTML report file
+
+	#let's get the investigator's name, so that we can have some
+	#kind of chain of evidence on the document
+	print "Investigator's name: ";
+	my $investigator = <STDIN>;
+	my $fileMatches = ($totalMatches/3);	
+	chomp ($investigator);
+	print "\n";
+
+	#first, let's create the report path
+	mkdir $reportPath;
+	open(REPORT, ">", $reportPath . "/" . "index.html");
+	
+	print REPORT "<!DOCTYPE html PUBLIC \"-//W3C//DTD HTML 4.01//EN\">\n
+			<html>\n
+			<head>
+			\t	<title>HashLibrarian Report: $startDirectory</title>\n
+			\t	<link rel=\"stylesheet\" href=\"report.css\">\n
+			\t	<SCRIPT SRC=\"report.js\"></SCRIPT>\n
+			</head>\n
+			\n
+			<body>\n
+			<div class=\"pagetitle\">HashLibrarian Report: $startDirectory</div>\n
+			<div class=\"investigationInfo\">\n
+			\t	Investigator: $investigator<br>\n
+			\t	Time started: $startDate<br>
+			\t	Time ended: $endDate<br>
+			</div>\n
+			<hr>\n
+			\n
+			<div class=\"fileListing\">";
+
+	print REPORT "\t<div class=\"directory\" id=\"1\"><a href=\"javascript:showElement('f1');\">+</a>  All Files<br>\n
+				\t<div class=\"file\" id=\"f1\" style=\"display: none;\">\n";
+	
+	#This outputs the HTML code for all files
+	while ((my $key, my $value) = each(%MD5Sums)) {
+
+		print REPORT "<div class=\"hash\">$startDirectory/$key<br>\n
+			<b>MD5:</b> $value<br>\n
+			<b>SHA1:</b> $SHA1Sums{$key}<br>\n
+			<b>SHA256:</b> $SHA256Sums{$key}<br><br></div>\n";
+
+
+	}
+	
+
+	print REPORT "		</div>\n
+			</div>\n
+		</div>\n
+		<br><br>\n";
+
+	#This outputs the HTML code for ONLY matches	
+	my $iteration=0;
+	print REPORT "\t<div class=\"match\" id=\"1\"><a href=\"javascript:showElement('f2');\">+</a>  Matches<br>\n
+				\t<div class=\"file\" id=\"f2\" style=\"display: none;\">\n";
+
+	while ((my $key, my $value) = each(%MD5Sums)) {
+		if(defined($matchDatabases{$key}))
+		{				
+			print REPORT "<div class=\"match\">$startDirectory/$key<br>\n
+			<b>MD5:</b> $value<br>\n
+			<b>SHA1:</b> $SHA1Sums{$key}<br>\n
+			<b>SHA256:</b> $SHA256Sums{$key}<br>\n
+			<b>From Database:</b> $matchDatabases{$key}<br><br>\n
+				";
+	
+		}
+		$iteration++;
+	}
+	print REPORT "</div></div></div></div><br><br>
+		<div class=\"Summary\">
+			Total files scanned: $filesHashed<br>
+			Total matches: $fileMatches<br>
+			Files not scanned: 0<br>
+		</div>
+		</body>";
+	
+	close(REPORT);
+	#Now, if our report directory does not contain the stylesheet and javascript files required by the
+	#report html file, re-copy them. However, DON'T recopy them if they're already there, since the
+	#user may have customized the files
+
+	if( -r $reportPath . "/report.css")
+	{ 
+		if($doVerbose==1)
+		{
+			
+			
+		}		
+	}
+	else {
+		print "report.css does not exist in report directory. Recreating it.\n";		 
+		system "cp report/report.css $reportPath";
+	}
+
+	if( -r $reportPath . "/report.js")
+	{ 
+		if($doVerbose==1)
+		{
+			
+			
+		}		
+	}
+	else {
+		print "report.js does not exist in report directory. Recreating it.\n";		 
+		system "cp report/report.js $reportPath";
+	}
+	if($doVerbose == 1)
+	{
+		print "Report exported to $reportPath\n";
+	}
+	
+
+}
+
+sub checkConfiguration
+{
+	#This function basically 'pings' different utilities that HashLibrarian uses
+	#we check md5sum, sha1sum, and sha256sum	
+	if($doVerbose==1) { print "Checking system configuration\n"; }
+	my $md5path = `which md5sum`;		#read into memory the path of md5sum
+	chomp($md5path);
+	if(-e $md5path) {			#if it looks like it exists
+		if($doVerbose==1) {
+				print "\tmd5sum exists($md5path)\n";
+		}
+	}
+	else { print "Error: cannot find md5sum!\n"; }
+	
+
+	my $sha1path = `which sha1sum`;	#read into memory the path of sha1sum
+	chomp($sha1path);
+	if(-e $sha1path) {		#if it looks like it exists
+		if($doVerbose==1) {
+				print "\tsha1sum exists($sha1path)\n";
+		}
+	}
+	else { die "Error: Cannot find sha1sum!\n"; }
+	
+	
+	my $sha256path = `which sha256sum`;	#read into memory the path of md5sum
+	chomp($sha256path);
+	if(-e $sha256path) {		#if it looks like it exists
+		if($doVerbose==1) {
+				print "\tsha256sum exists($sha256path)\n";
+		}
+	}
+	else { die "Error: Cannot find sha256sum!\n"; }			
+	
+}
+
+
+sub compareHashes()
+{
+	#Function: compareHashes()
+	#Input: Two hashes
+	#Output: A 1 for a positive match, a 0 for a negative match
+	#Summary: Simply compares two passed hashes and returns the result
+
+
+	if($_[0] eq $_[1])
+	{
+		return 1;
+	}
+	else
+	{
+		return 0;
+	}
+}
+
+sub moveToTerminalLeft
+{
+	print "\b" x100;	#Move back 100 spaces in the terminal. This is to make our progress bar look like it's updating live
+}
+
+sub showUsageAndDie
+{
+	print "Usage: hashlibr [-d|-f] [/dir/|/file.file] -db [/path_to_output_database] -rp [/path_to_report_folder]\n";
+	print "   -d\t\tHash a directory recursively\n";
+	print "   -f\t\tHash a file\n";
+	print "   -v\t\tVerbose\n";
+	print "   -term\tOutput the hashes to the terminal (for use with netcat/cryptcat)\n";
+	print "   -db\t\tSave the output to a database\n";
+	print "   -rp\t\tGenerate an HTML report of hash results\n";
+	print "   -compare\tCompare the hashes found to a list of database files\n";
+	print "   -protect\tProtect the resultant database (GPG and chattr +i)\n";
+	print "   -chattr\tStop HashLibrarian from location-locking files.\n";
+	die "\n\n";
+}
+
+
+HashLibrarian(); #Starts the program
